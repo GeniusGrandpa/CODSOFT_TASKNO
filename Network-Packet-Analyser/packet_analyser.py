@@ -1,41 +1,69 @@
-import csv
 import argparse
+import csv
+import logging
+import sys
+
 from datetime import datetime
+from pathlib import Path
+from time import monotonic
 
-from scapy.all import sniff, IP, TCP, UDP, ICMP
+from scapy.all import sniff, IP, TCP, UDP, ICMP, get_if_list
 
+PROTOCOL_FILTERS = {
+    "all": "ip",
+    "tcp": "ip and tcp",
+    "udp": "ip and udp",
+    "icmp": "ip and icmp",
+}
 
+CSV_FIELDS = [
+    "Timestamp",
+    "Source IP",
+    "Source Port",
+    "Destination IP",
+    "Destination Port",
+    "Protocol",
+    "Size (bytes)",
+]
 packet_counts = {
     "TCP": 0,
     "UDP": 0,
     "ICMP": 0,
-    "Other": 0
+    "Other": 0,
 }
 
 total_packets = 0
 total_bytes = 0
-captured_packets = []
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+logger = logging.getLogger(__name__)
 
 
 def identify_protocol(packet):
     if packet.haslayer(TCP):
         return "TCP"
+
     elif packet.haslayer(UDP):
         return "UDP"
+
     elif packet.haslayer(ICMP):
         return "ICMP"
-    else:
-        return "Other"
+
+    return "Other"
 
 
-def analyze_packet(packet):
+def analyze_packet(packet, csv_writer, csv_file):
     global total_packets, total_bytes
-
     if not packet.haslayer(IP):
         return
 
     source_ip = packet[IP].src
     destination_ip = packet[IP].dst
+
     protocol = identify_protocol(packet)
 
     source_port = "N/A"
@@ -50,11 +78,9 @@ def analyze_packet(packet):
         destination_port = packet[UDP].dport
 
     packet_size = len(packet)
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-
-    packet_counts[protocol] += 1
-    total_packets += 1
-    total_bytes += packet_size
+    timestamp = datetime.fromtimestamp(
+        float(packet.time)
+    ).astimezone().isoformat(timespec="milliseconds")
 
     packet_record = {
         "Timestamp": timestamp,
@@ -63,109 +89,224 @@ def analyze_packet(packet):
         "Destination IP": destination_ip,
         "Destination Port": destination_port,
         "Protocol": protocol,
-        "Size (bytes)": packet_size
+        "Size (bytes)": packet_size,
     }
-
-    captured_packets.append(packet_record)
-
+    packet_counts[protocol] += 1
+    total_packets += 1
+    total_bytes += packet_size
+    csv_writer.writerow(packet_record)
+    csv_file.flush()
     print(
-        f"{timestamp:<23} | "
+        f"{timestamp:<29} | "
         f"{source_ip:<15} | "
         f"{str(source_port):<11} | "
         f"{destination_ip:<15} | "
         f"{str(destination_port):<12} | "
         f"{protocol:<8} | "
-        f"{packet_size} B"
+        f"{packet_size} B",
+        flush=True,
     )
 
+def display_statistics(start_time):
+    duration = monotonic() - start_time
 
-def export_to_csv(filename):
-    if not captured_packets:
-        print("\nNo IPv4 packets matched the selected filter.")
-        return
-
-    fieldnames = list(captured_packets[0].keys())
-
-    with open(filename, "w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(captured_packets)
-
-    print(f"\nPacket details exported to: {filename}")
+    print("\n")
+    print("CAPTURE SUMMARY")
 
 
-def display_statistics():
     print(f"Total IPv4 packets analyzed: {total_packets}")
+    print(f"Total packet bytes: {total_bytes}")
+    print(f"Capture duration: {duration:.2f} seconds")
 
-    print("\nProtocol Distribution:")
-
-    for protocol, count in packet_counts.items():
-        print(f"{protocol:<6}: {count}")
-
-    print(f"\nTotal packet data captured: {total_bytes} bytes")
+    if duration > 0:
+        print(f"Average packet rate: {total_packets / duration:.2f} packets/sec")
+        print(f"Average byte rate: {total_bytes / duration:.2f} bytes/sec")
 
     if total_packets > 0:
         average_size = total_bytes / total_packets
         print(f"Average packet size: {average_size:.2f} bytes")
 
+    print("\nProtocol Distribution:")
 
+    for protocol, count in packet_counts.items():
+        percentage = (
+            count / total_packets * 100
+            if total_packets > 0
+            else 0
+        )
 
-def main():
-    global captured_packets
+        print(
+            f"{protocol:<6}: {count:>6} packets "
+            f"({percentage:.2f}%)"
+        )
 
+def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Network Packet Analyzer with protocol filtering"
+        description="Network Packet Analyzer - Version 6",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument(
+        "-i",
+        "--iface",
+        help="Network interface to monitor",
     )
 
     parser.add_argument(
         "-f",
         "--filter",
-        choices=["all", "tcp", "udp", "icmp"],
+        choices=PROTOCOL_FILTERS.keys(),
         default="all",
-        help="Choose which IPv4 protocol to analyze"
+        help="Protocol filter",
+    )
+
+    parser.add_argument(
+        "-c",
+        "--count",
+        type=int,
+        default=0,
+        help="Maximum number of matching packets; 0 means unlimited",
+    )
+
+    parser.add_argument(
+        "-d",
+        "--duration",
+        type=float,
+        default=0,
+        help="Maximum capture duration in seconds; 0 means unlimited",
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="Custom CSV output path",
     )
 
     args = parser.parse_args()
 
+    if args.count < 0:
+        parser.error("--count cannot be negative")
+
+    if args.duration < 0:
+        parser.error("--duration cannot be negative")
+
+    if args.duration > 0 and not args.duration < float("inf"):
+        parser.error("--duration must be finite")
+
+    return args
+
+
+def main():
+    args = parse_arguments()
+    if args.iface:
+        try:
+            interfaces = get_if_list()
+        except Exception as error:
+            logger.error("Unable to list network interfaces: %s", error)
+            return 1
+
+        if args.iface not in interfaces:
+            logger.error("Network interface '%s' was not found.", args.iface)
+
+            print("\nAvailable interfaces:")
+
+            for interface in interfaces:
+                print(f"  - {interface}")
+
+            return 1
     capture_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_filename = f"packet_capture_{args.filter}_{capture_time}.csv"
 
-    bpf_filters = {
-        "all": "ip",
-        "tcp": "ip and tcp",
-        "udp": "ip and udp",
-        "icmp": "ip and icmp"
-    }
+    if args.output:
+        output_path = Path(args.output).expanduser()
+    else:
+        output_path = (
+            Path("captures")
+            / f"packet_capture_{args.filter}_{capture_time}.csv"
+        )
 
-    print("NETWORK PACKET ANALYZER")
-    print(f"Selected filter: {args.filter.upper()}")
-    print("Capturing packets... Press Ctrl+C to stop.\n")
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    except OSError as error:
+        logger.error("Unable to create output directory: %s", error)
+        return 1
+
+    capture_filter = PROTOCOL_FILTERS[args.filter]
+    print(f"Interface: {args.iface or 'Default interface selection'}")
+    print(f"Protocol filter: {args.filter.upper()}")
+    print(f"Capture filter: {capture_filter}")
+    print(f"Packet limit: {args.count or 'Unlimited'}")
+    print(f"Duration limit: {args.duration or 'Unlimited'} seconds")
+    print(f"CSV output: {output_path}")
+    print("\nPress Ctrl+C to stop capturing.")
     print(
-        f"{'TIMESTAMP':<23} | "
+        f"{'TIMESTAMP':<29} | "
         f"{'SOURCE IP':<15} | "
         f"{'SOURCE PORT':<11} | "
         f"{'DESTINATION IP':<15} | "
         f"{'DEST PORT':<12} | "
         f"{'PROTOCOL':<8} | SIZE"
     )
-
-    print("-" * 125)
+    start_time = monotonic()
+    capture_error = False
 
     try:
-        sniff(
-            filter=bpf_filters[args.filter],
-            prn=analyze_packet,
-            store=False
-        )
+        with output_path.open(
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as csv_file:
+
+            csv_writer = csv.DictWriter(
+                csv_file,
+                fieldnames=CSV_FIELDS,
+            )
+
+            csv_writer.writeheader()
+            csv_file.flush()
+
+            logger.info("Packet capture started.")
+
+            sniff(
+                iface=args.iface,
+                filter=capture_filter,
+                prn=lambda packet: analyze_packet(
+                    packet,
+                    csv_writer,
+                    csv_file,
+                ),
+                store=False,
+                count=args.count,
+                timeout=args.duration or None,
+            )
 
     except KeyboardInterrupt:
-        print("\nPacket capture stopped.")
+        print("\n\nPacket capture stopped by user.")
+        logger.info("Capture interrupted by user.")
+
+    except PermissionError:
+        logger.error(
+            "Permission denied. Check your packet-capture permissions."
+        )
+        capture_error = True
+
+    except OSError as error:
+        logger.error("Network or file error: %s", error)
+        capture_error = True
+
+    except Exception as error:
+        logger.error("Packet capture failed: %s", error)
+        capture_error = True
 
     finally:
-        export_to_csv(csv_filename)
-        display_statistics()
+        print(f"\nCSV output: {output_path}")
+
+        display_statistics(start_time)
+
+        logger.info("Packet capture session ended.")
+
+    return 1 if capture_error else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
