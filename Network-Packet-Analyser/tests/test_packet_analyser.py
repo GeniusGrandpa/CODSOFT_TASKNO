@@ -129,3 +129,58 @@ def test_non_ipv4_packet_is_ignored():
     rows = list(csv.DictReader(output))
 
     assert len(rows) == 0
+
+
+def test_extract_payload():
+    """Check that raw payload is returned as hexadecimal."""
+
+    packet = IP() / TCP() / b"hello"
+
+    assert analyzer.extract_payload(packet) == b"hello".hex()
+
+
+def test_extract_payload_without_raw_layer():
+    """Check that packets without raw payload return an empty string."""
+
+    packet = IP() / TCP()
+
+    assert analyzer.extract_payload(packet) == ""
+
+
+def test_analyze_tcp_packet_includes_payload():
+    """Check that packet payload is exported to CSV."""
+
+    packet = (
+        IP(src="192.0.2.1", dst="198.51.100.1")
+        / TCP(sport=12345, dport=443)
+        / b"hello"
+    )
+
+    output = io.StringIO()
+
+    writer = csv.DictWriter(
+        output,
+        fieldnames=analyzer.CSV_FIELDS,
+    )
+    writer.writeheader()
+
+    analyzer.analyze_packet(packet, writer, output)
+
+    output.seek(0)
+    rows = list(csv.DictReader(output))
+
+    assert len(rows) == 1
+    assert rows[0]["Payload (hex)"] == b"hello".hex()
+    assert rows[0]["Protocol"] == "TCP"
+    assert analyzer.total_packets == 1
+
+
+def test_identify_other_ipv4_protocol():
+    """Check classification of IPv4 packets without TCP, UDP, or ICMP."""
+
+    from scapy.all import GRE
+
+    packet = IP() / GRE()
+
+    assert analyzer.identify_protocol(packet) == "Other"
+

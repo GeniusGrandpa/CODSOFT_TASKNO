@@ -1,13 +1,14 @@
 import argparse
 import csv
 import logging
+import math
 import sys
 
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
 
-from scapy.all import sniff, IP, TCP, UDP, ICMP, get_if_list
+from scapy.all import sniff, IP, TCP, UDP, ICMP, get_if_list, Raw
 
 PROTOCOL_FILTERS = {
     "all": "ip",
@@ -24,7 +25,9 @@ CSV_FIELDS = [
     "Destination Port",
     "Protocol",
     "Size (bytes)",
+    "Payload (hex)",
 ]
+
 packet_counts = {
     "TCP": 0,
     "UDP": 0,
@@ -34,6 +37,7 @@ packet_counts = {
 
 total_packets = 0
 total_bytes = 0
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -47,23 +51,31 @@ def identify_protocol(packet):
     if packet.haslayer(TCP):
         return "TCP"
 
-    elif packet.haslayer(UDP):
+    if packet.haslayer(UDP):
         return "UDP"
 
-    elif packet.haslayer(ICMP):
+    if packet.haslayer(ICMP):
         return "ICMP"
 
     return "Other"
 
 
+def extract_payload(packet):
+    """Return the application-data candidate as hexadecimal text."""
+    if packet.haslayer(Raw):
+        return bytes(packet[Raw].load).hex()
+
+    return ""
+
+
 def analyze_packet(packet, csv_writer, csv_file):
     global total_packets, total_bytes
+
     if not packet.haslayer(IP):
         return
 
     source_ip = packet[IP].src
     destination_ip = packet[IP].dst
-
     protocol = identify_protocol(packet)
 
     source_port = "N/A"
@@ -78,9 +90,12 @@ def analyze_packet(packet, csv_writer, csv_file):
         destination_port = packet[UDP].dport
 
     packet_size = len(packet)
+
     timestamp = datetime.fromtimestamp(
         float(packet.time)
     ).astimezone().isoformat(timespec="milliseconds")
+
+    payload_hex = extract_payload(packet)
 
     packet_record = {
         "Timestamp": timestamp,
@@ -90,12 +105,16 @@ def analyze_packet(packet, csv_writer, csv_file):
         "Destination Port": destination_port,
         "Protocol": protocol,
         "Size (bytes)": packet_size,
+        "Payload (hex)": payload_hex,
     }
+
     packet_counts[protocol] += 1
     total_packets += 1
     total_bytes += packet_size
+
     csv_writer.writerow(packet_record)
     csv_file.flush()
+
     print(
         f"{timestamp:<29} | "
         f"{source_ip:<15} | "
@@ -107,20 +126,24 @@ def analyze_packet(packet, csv_writer, csv_file):
         flush=True,
     )
 
+
 def display_statistics(start_time):
     duration = monotonic() - start_time
 
-    print("\n")
-    print("CAPTURE SUMMARY")
-
-
+    print("\nCAPTURE SUMMARY")
     print(f"Total IPv4 packets analyzed: {total_packets}")
     print(f"Total packet bytes: {total_bytes}")
     print(f"Capture duration: {duration:.2f} seconds")
 
     if duration > 0:
-        print(f"Average packet rate: {total_packets / duration:.2f} packets/sec")
-        print(f"Average byte rate: {total_bytes / duration:.2f} bytes/sec")
+        print(
+            f"Average packet rate: "
+            f"{total_packets / duration:.2f} packets/sec"
+        )
+        print(
+            f"Average byte rate: "
+            f"{total_bytes / duration:.2f} bytes/sec"
+        )
 
     if total_packets > 0:
         average_size = total_bytes / total_packets
@@ -140,9 +163,10 @@ def display_statistics(start_time):
             f"({percentage:.2f}%)"
         )
 
+
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Network Packet Analyzer - Version 6",
+        description="Network Packet Analyzer",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -165,7 +189,7 @@ def parse_arguments():
         "--count",
         type=int,
         default=0,
-        help="Maximum number of matching packets; 0 means unlimited",
+        help="Maximum matching packets; 0 means unlimited",
     )
 
     parser.add_argument(
@@ -187,17 +211,32 @@ def parse_arguments():
     if args.count < 0:
         parser.error("--count cannot be negative")
 
-    if args.duration < 0:
-        parser.error("--duration cannot be negative")
+    if not math.isfinite(args.duration) or args.duration < 0:
+        parser.error("--duration must be a finite, non-negative number")
 
-    if args.duration > 0 and not args.duration < float("inf"):
-        parser.error("--duration must be finite")
+    if args.count == 0 and args.duration == 0:
+        logger.warning(
+            "Capture has no count or duration limit. "
+            "Press Ctrl+C to stop."
+        )
 
     return args
 
 
 def main():
+    global packet_counts, total_packets, total_bytes
+
     args = parse_arguments()
+
+    packet_counts = {
+        "TCP": 0,
+        "UDP": 0,
+        "ICMP": 0,
+        "Other": 0,
+    }
+    total_packets = 0
+    total_bytes = 0
+
     if args.iface:
         try:
             interfaces = get_if_list()
@@ -206,14 +245,17 @@ def main():
             return 1
 
         if args.iface not in interfaces:
-            logger.error("Network interface '%s' was not found.", args.iface)
-
+            logger.error(
+                "Network interface '%s' was not found.",
+                args.iface,
+            )
             print("\nAvailable interfaces:")
 
             for interface in interfaces:
                 print(f"  - {interface}")
 
             return 1
+
     capture_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     if args.output:
@@ -232,6 +274,7 @@ def main():
         return 1
 
     capture_filter = PROTOCOL_FILTERS[args.filter]
+
     print(f"Interface: {args.iface or 'Default interface selection'}")
     print(f"Protocol filter: {args.filter.upper()}")
     print(f"Capture filter: {capture_filter}")
@@ -247,6 +290,7 @@ def main():
         f"{'DEST PORT':<12} | "
         f"{'PROTOCOL':<8} | SIZE"
     )
+
     start_time = monotonic()
     capture_error = False
 
@@ -261,7 +305,6 @@ def main():
                 csv_file,
                 fieldnames=CSV_FIELDS,
             )
-
             csv_writer.writeheader()
             csv_file.flush()
 
@@ -281,12 +324,13 @@ def main():
             )
 
     except KeyboardInterrupt:
-        print("\n\nPacket capture stopped by user.")
+        print("\nPacket capture stopped by user.")
         logger.info("Capture interrupted by user.")
 
     except PermissionError:
         logger.error(
-            "Permission denied. Check your packet-capture permissions."
+            "Permission denied. Check packet-capture permissions "
+            "and output-file permissions."
         )
         capture_error = True
 
@@ -300,9 +344,7 @@ def main():
 
     finally:
         print(f"\nCSV output: {output_path}")
-
         display_statistics(start_time)
-
         logger.info("Packet capture session ended.")
 
     return 1 if capture_error else 0
